@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import './App.css';
 import perp from './abi.json';
@@ -28,6 +28,50 @@ function App() {
     takerFee: '15', // 0.15% in basis points
   });
 
+  // Handle wallet account changes
+  useEffect(() => {
+    const handleAccountsChanged = (accounts) => {
+      if (accounts.length === 0) {
+        // User disconnected wallet
+        setAccount('');
+        setChainId(null);
+        setProvider(null);
+        setContract(null);
+      } else if (accounts[0] !== account) {
+        // Account changed
+        setAccount(accounts[0]);
+        setupContractWithSigner();
+      }
+    };
+
+    const handleChainChanged = (chainIdHex) => {
+      window.location.reload();
+    };
+
+    // Add listeners for account and chain changes
+    if (window.ethereum) {
+      window.ethereum.on('accountsChanged', handleAccountsChanged);
+      window.ethereum.on('chainChanged', handleChainChanged);
+    }
+
+    // Detect WalletConnect provider
+    if (window.ethereum?.isWalletConnect) {
+      console.log("WalletConnect provider detected");
+    }
+
+    // Check for Rainbow or other wallets
+    if (window.ethereum?.isRainbow) {
+      console.log("Rainbow wallet detected");
+    }
+
+    return () => {
+      if (window.ethereum) {
+        window.ethereum.removeListener('accountsChanged', handleAccountsChanged);
+        window.ethereum.removeListener('chainChanged', handleChainChanged);
+      }
+    };
+  }, [account]);
+
   const handleInputChange = (e) => {
     const { name, value } = e.target;
     setNewMarket({
@@ -36,84 +80,145 @@ function App() {
     });
   };
 
-  const connectWallet = async () => {
-    setLoading(true);
-    setError('');
-    console.log('Provider details:', {
-      isMetaMask: window.ethereum?.isMetaMask,
-      selectedAddress: window.ethereum?.selectedAddress,
-      chainId: window.ethereum?.chainId,
-    });
+  const detectEthereumProvider = async () => {
+    // First check for window.ethereum
+    if (window.ethereum) {
+      return window.ethereum;
+    }
 
+    // Check for multiple wallet providers
+    if (window.providers) {
+      return window.providers.find(p => p.isMetaMask || p.isRainbow || p.isCoinbaseWallet || p.isWalletConnect);
+    }
+
+    // No provider found
+    return null;
+  };
+
+  const setupContractWithSigner = async () => {
     try {
-      if (!window.ethereum) {
-        throw new Error('No Ethereum provider detected. Please install MetaMask.');
-      }
-      if (!window.ethereum.isMetaMask) {
-        throw new Error('MetaMask not detected.');
-      }
-
-      console.log('Requesting accounts...');
-      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-      console.log('Accounts received:', accounts);
-
-      if (!accounts || accounts.length === 0) {
-        throw new Error('No accounts returned by MetaMask.');
-      }
-
-      const provider = new ethers.BrowserProvider(window.ethereum, {
-        name: 'base-sepolia',
-        chainId: 84532,
-        url: 'https://sepolia.base.org',
-      });
-
-      // Disable ENS resolution
-      provider.resolveName = async () => null;
-
-      const { chainId } = await provider.getNetwork();
-      console.log('Chain ID:', chainId);
-      setChainId(Number(chainId));
-
-      if (Number(chainId) !== 84532) {
-        console.log('Switching to Base Sepolia...');
-        try {
-          await window.ethereum.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: '0x14a34' }],
-          });
-        } catch (switchError) {
-          if (switchError.code === 4902) {
-            await window.ethereum.request({
-              method: 'wallet_addEthereumChain',
-              params: [
-                {
-                  chainId: '0x14a34',
-                  chainName: 'Base Sepolia',
-                  rpcUrls: ['https://sepolia.base.org'],
-                  nativeCurrency: {
-                    name: 'ETH',
-                    symbol: 'ETH',
-                    decimals: 18,
-                  },
-                  blockExplorerUrls: ['https://sepolia-explorer.base.org'],
-                },
-              ],
-            });
-          } else {
-            throw switchError;
-          }
-        }
-        const updatedProvider = new ethers.BrowserProvider(window.ethereum);
-        updatedProvider.resolveName = async () => null;
-        setProvider(updatedProvider);
-      } else {
-        setProvider(provider);
-      }
+      if (!provider) return;
 
       const signer = await provider.getSigner();
       const account = await signer.getAddress();
+      console.log('Setting up contract with signer from account:', account);
+
+      const contractAddress = ethers.getAddress(PERPS_MARKET_PROXY_ADDRESS);
+      const contract = new ethers.Contract(contractAddress, perp, signer);
+
+      setContract(contract);
+    } catch (err) {
+      console.error('Failed to setup contract with signer:', err);
+      setError('Failed to setup contract: ' + err.message);
+    }
+  };
+
+  const switchToBaseSepolia = async (provider) => {
+    const BASE_SEPOLIA_CHAIN_ID = '0x14a34'; // 84532 in hex
+
+    try {
+      await provider.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }],
+      });
+      return true;
+    } catch (switchError) {
+      // This error code indicates that the chain has not been added to the wallet
+      if (switchError.code === 4902) {
+        try {
+          await provider.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: BASE_SEPOLIA_CHAIN_ID,
+                chainName: 'Base Sepolia',
+                rpcUrls: ['https://sepolia.base.org'],
+                nativeCurrency: {
+                  name: 'ETH',
+                  symbol: 'ETH',
+                  decimals: 18,
+                },
+                blockExplorerUrls: ['https://sepolia-explorer.base.org'],
+              },
+            ],
+          });
+          // Try switching again after adding
+          await provider.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }],
+          });
+          return true;
+        } catch (addError) {
+          console.error('Error adding Base Sepolia to wallet:', addError);
+          throw addError;
+        }
+      } else {
+        console.error('Error switching to Base Sepolia:', switchError);
+        throw switchError;
+      }
+    }
+  };
+
+  const connectWallet = async () => {
+    setLoading(true);
+    setError('');
+
+    try {
+      // Detect any available Ethereum provider
+      const ethereumProvider = await detectEthereumProvider();
+
+      if (!ethereumProvider) {
+        throw new Error('No Ethereum wallet detected. Please install MetaMask, Rainbow, or another web3 wallet.');
+      }
+
+      console.log('Wallet provider details:', {
+        isMetaMask: ethereumProvider.isMetaMask,
+        isRainbow: ethereumProvider.isRainbow,
+        isCoinbaseWallet: ethereumProvider.isCoinbaseWallet,
+        isWalletConnect: ethereumProvider.isWalletConnect,
+        selectedAddress: ethereumProvider.selectedAddress,
+        chainId: ethereumProvider.chainId,
+      });
+
+      // Request accounts access
+      console.log('Requesting accounts...');
+      const accounts = await ethereumProvider.request({ method: 'eth_requestAccounts' });
+      console.log('Accounts received:', accounts);
+
+      if (!accounts || accounts.length === 0) {
+        throw new Error('No accounts returned by wallet.');
+      }
+
+      // Initialize ethers provider with the detected Ethereum provider
+      const ethersProvider = new ethers.BrowserProvider(ethereumProvider);
+
+      // Disable ENS resolution to avoid potential issues
+      ethersProvider.resolveName = async () => null;
+
+      // Get current chain ID
+      const { chainId } = await ethersProvider.getNetwork();
+      console.log('Chain ID:', chainId);
+      setChainId(Number(chainId));
+
+      // Switch to Base Sepolia if needed
+      if (Number(chainId) !== 84532) {
+        console.log('Switching to Base Sepolia...');
+        await switchToBaseSepolia(ethereumProvider);
+
+        // Get updated provider after chain switch
+        const updatedProvider = new ethers.BrowserProvider(ethereumProvider);
+        updatedProvider.resolveName = async () => null;
+        setProvider(updatedProvider);
+      } else {
+        setProvider(ethersProvider);
+      }
+
+      // Get signer and address
+      const signer = await ethersProvider.getSigner();
+      const account = await signer.getAddress();
       console.log('Connected account:', account);
 
+      // Initialize contract with signer
       const contractAddress = ethers.getAddress(PERPS_MARKET_PROXY_ADDRESS);
       const contract = new ethers.Contract(contractAddress, perp, signer);
 
@@ -122,9 +227,9 @@ function App() {
     } catch (err) {
       console.error('Connection error:', err);
       if (err.code === 4001) {
-        setError('MetaMask connection rejected. Please approve the connection.');
+        setError('Wallet connection rejected. Please approve the connection.');
       } else if (err.code === -32002) {
-        setError('MetaMask request pending. Check MetaMask and try again.');
+        setError('Wallet request pending. Check your wallet and try again.');
       } else {
         setError(err.message || 'Failed to connect wallet.');
       }
@@ -179,7 +284,7 @@ function App() {
     }
   };
 
-  // New function to create a market
+  // Function to create a market
   const createMarket = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -271,6 +376,18 @@ function App() {
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value);
   };
 
+  // Helper to identify the wallet provider type
+  const getWalletName = () => {
+    if (!window.ethereum) return 'Wallet';
+
+    if (window.ethereum.isRainbow) return 'Rainbow';
+    if (window.ethereum.isMetaMask) return 'MetaMask';
+    if (window.ethereum.isCoinbaseWallet) return 'Coinbase Wallet';
+    if (window.ethereum.isWalletConnect) return 'WalletConnect';
+
+    return 'Wallet';
+  };
+
   return (
     <div className="app-container">
       <header className="app-header">
@@ -285,7 +402,7 @@ function App() {
               onClick={connectWallet}
               disabled={loading}
             >
-              {loading ? 'Connecting...' : 'Connect Wallet'}
+              {loading ? 'Connecting...' : `Connect ${getWalletName()}`}
             </button>
           ) : (
             <div className="connection-info">
